@@ -1,115 +1,92 @@
 package main
 
 import (
+	"bytes"
 	"encoding/csv"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"os"
 	"strconv"
-	"strings"
 	"sync"
 )
 
-// Product структура для представления товара
-type Product struct {
-	Name        string
-	Description string
-	Price       float64
-}
-
-func main() {
-	// Чтение CSV-файла с товарами
-	file, err := os.Open("products.csv")
+// Функция для загрузки товаров на Озон
+func loadProductsToOzon(filename string, apiKey string) {
+	// Чтение содержимого CSV-файла
+	file, err := os.Open(filename)
 	if err != nil {
-		log.Fatal("Failed to open CSV file:", err)
+		log.Fatalf("Failed to open CSV file: %v", err)
 	}
 	defer file.Close()
 
-	// Создание CSV-ридера
+	// Парсинг CSV-данных
 	reader := csv.NewReader(file)
-
-	// Чтение всех записей из CSV-файла
-	products := make([]Product, 0)
-	for {
-		record, err := reader.Read()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			log.Fatal("Failed to read CSV record:", err)
-		}
-
-		price, err := strconv.ParseFloat(record[2], 64)
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		// Создание структуры Product из записи CSV
-		product := Product{
-			Name:        record[0],
-			Description: record[1],
-			Price:       price,
-		}
-		products = append(products, product)
+	records, err := reader.ReadAll()
+	if err != nil {
+		log.Fatalf("Failed to read CSV data: %v", err)
 	}
 
-	// Создание клиента HTTP
-	client := &http.Client{}
+	// Создание канала для ограничения количества горутин
+	semaphore := make(chan struct{}, 5) // Максимальное количество горутин
 
-	// Создание канала для ограничения количества одновременно выполняющихся горутин
-	concurrentGoroutines := make(chan struct{}, 10) // ограничение на 10 горутин
+	var wg sync.WaitGroup
 
-	// Создание WaitGroup для ожидания завершения всех горутин
-	wg := sync.WaitGroup{}
-
-	// Импорт товаров в Озон
-	for _, product := range products {
-		// Добавление горутины в WaitGroup
+	// Обработка каждой записи из CSV-файла
+	for _, record := range records {
 		wg.Add(1)
+		go func(record []string) {
+			defer wg.Done()
 
-		// Отправка запроса на импорт товара в отдельной  горутине
-		go func(p Product) {
-			// Ожидание доступа в канал
-			concurrentGoroutines <- struct{}{}
+			// Ожидание места в канале
+			semaphore <- struct{}{}
 
-			// Отправка запроса на API Озона
-			url := "https://api.ozon.ru/composer-api.bx/page/json/v1"
-			reqBody := fmt.Sprintf(`{
-				"name": "%s",
-				"description": "%s",
-				"price": %.2f
-			}`, p.Name, p.Description, p.Price)
-			resp, err := client.Post(url, "application/json", strings.NewReader(reqBody))
+			// Извлечение данных из записи CSV
+			productName := record[0]
+			productPrice := parsePrice(record[1])
+
+			// Формирование запроса на API Озона
+			url := fmt.Sprintf("https://api-seller.ozon.ru/v1/product/import?sku=%s&price=%f&apikey=%s", productName, productPrice, apiKey)
+			resp, err := http.Post(url, "application/json", bytes.NewReader(nil))
 			if err != nil {
-				log.Println("Failed to send request:", err)
-				wg.Done()
-				<-concurrentGoroutines
+				log.Printf("API request failed: %v", err)
+				<-semaphore // Освобождение места в канале при ошибке
 				return
 			}
 			defer resp.Body.Close()
 
-			// Проверка статуса ответа
+			// Проверка кода ответа
 			if resp.StatusCode != http.StatusOK {
-				log.Println("Failed to import product:", resp.Status)
-				wg.Done()
-				<-concurrentGoroutines
+				log.Printf("API request failed with status code %d", resp.StatusCode)
+				<-semaphore // Освобождение места в канале при ошибке
 				return
 			}
 
-			// Логирование успешного импорта товара
-			log.Println("Product imported successfully:", p.Name)
+			// Обработка успешного ответа
+			log.Printf("Product '%s' successfully imported", productName)
 
-			// Операция выполнена, освобождение канала и завершение горутины
-			wg.Done()
-			<-concurrentGoroutines
-		}(product)
+			<-semaphore // Освобождение места в канале после успешной загрузки товара
+		}(record)
 	}
 
 	// Ожидание завершения всех горутин
 	wg.Wait()
 
-	log.Println("All products imported successfully!")
+	log.Println("All products imported")
+}
 
+// Функция для преобразования строки с ценой в число
+func parsePrice(priceStr string) float64 {
+	price, err := strconv.ParseFloat(priceStr, 64)
+	if err != nil {
+		log.Printf("Error parsing price '%s': %v", priceStr, err)
+		return 0.0
+	}
+	return price
+}
+func main() {
+	// Параметры загрузки товаров
+	filename := "products.csv"
+	apiKey := "c6ac6335-ee09-42ae-a0c1-1d513cb437b2"
+	loadProductsToOzon(filename, apiKey)
 }
